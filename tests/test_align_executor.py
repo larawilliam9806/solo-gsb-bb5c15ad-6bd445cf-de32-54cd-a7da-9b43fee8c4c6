@@ -205,6 +205,44 @@ def test_executor_close_terminates_running_children():
     asyncio.run(scenario())
 
 
+def test_executor_close_covers_spawn_in_flight(monkeypatch):
+    """关闭时仍有已接纳请求卡在创建子进程：aclose 等其登记、终止回收后再返回。"""
+    executor = AlignExecutor(
+        max_processes=1, timeout_seconds=60, worker_argv=SLEEP_WORKER
+    )
+
+    async def scenario():
+        real_spawn = asyncio.create_subprocess_exec
+        spawn_started = asyncio.Event()
+        release_spawn = asyncio.Event()
+
+        async def fake_spawn(*args, **kwargs):
+            spawn_started.set()
+            await release_spawn.wait()  # 模拟 create_subprocess_exec 尚未返回
+            return await real_spawn(*args, **kwargs)
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_spawn)
+        task = asyncio.ensure_future(executor.run("甲", "甲"))
+        await spawn_started.wait()  # 请求已占名额，正等待子进程创建返回
+        assert executor.active == 1
+        close = asyncio.ensure_future(executor.aclose())
+        await asyncio.sleep(0.2)
+        # 子进程尚未登记，关闭不得提前结束
+        assert not close.done()
+        release_spawn.set()  # 创建完成：登记后应立即被终止回收
+        await asyncio.wait_for(close, timeout=10)
+        # 子进程已回收、名额已释放，aclose 才返回
+        assert executor.active == 0
+        assert not executor._children
+        with pytest.raises(AlignWorkerError):
+            await task
+        # 关闭开始后拒绝新请求
+        with pytest.raises(AlignBusyError):
+            await executor.run("甲", "甲")
+
+    asyncio.run(scenario())
+
+
 def test_api_align_success_response_unchanged():
     resp = client.post("/api/align", json={"left": "学而?习之", "right": "时习之不亦"})
     assert resp.status_code == 200
