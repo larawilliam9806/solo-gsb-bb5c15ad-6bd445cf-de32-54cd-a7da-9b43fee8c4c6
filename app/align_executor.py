@@ -12,9 +12,12 @@
 - ``ALIGN_TIMEOUT_SECONDS``：单次计算从**接纳**起的最长秒数，默认 10；
   超时即终止并回收子进程（接口映射为 504）。
 
-名额自接纳时占用，到子进程**回收完成**后才释放；正常结束、超时、客户端
-断开（任务取消）、子进程异常退出与服务关闭都汇入同一条终止-回收路径，
-不泄漏进程、不重复释放名额。
+名额自接纳时占用，到该请求的子进程**终止回收完成**后才释放；正常结束、
+超时、客户端断开（任务取消）、子进程异常退出与服务关闭都汇入同一条
+终止-回收路径，不泄漏进程、不重复释放名额。服务关闭（``aclose``）开始后
+拒绝一切新请求，并等待**所有已接纳请求**收尾——包括已占用名额、但仍在
+``create_subprocess_exec`` 创建途中尚未登记进 ``_children`` 的请求——直到
+其子进程终止回收、名额全部释放后才返回。
 """
 
 from __future__ import annotations
@@ -71,10 +74,14 @@ class AlignWorkerError(Exception):
 class AlignExecutor:
     """以独立子进程执行对齐计算的执行器。
 
-    - 名额（``max_processes``）统计**运行中或清理中**的子进程：接纳时占用，
-      子进程回收完成后才释放；
+    - 名额（``max_processes``）统计**运行中或清理中**的已接纳请求：接纳时
+      占用（即使子进程尚在 ``create_subprocess_exec`` 创建途中），该请求的
+      子进程终止回收完成后才释放；
     - 超时、客户端断开（任务被取消）、子进程异常退出都汇入 ``_terminate``
-      终止-回收路径；``aclose`` 在服务关闭时终止并回收全部残留子进程。
+      终止-回收路径；
+    - ``aclose`` 在服务关闭时先置关闭标志（此后新请求一律拒绝），再终止并
+      回收全部已登记子进程，并等待所有已接纳但尚未收尾的请求（含仍在创建
+      途中、子进程还没登记的请求）完成终止-回收、名额归零后才返回。
     """
 
     def __init__(
@@ -88,9 +95,12 @@ class AlignExecutor:
         self._max_processes = max_processes
         self._timeout_seconds = timeout_seconds
         self._worker_argv = tuple(worker_argv)
-        self._active = 0                                  # 运行中或清理中的子进程数
+        self._active = 0                                  # 已接纳且未释放名额的请求数
         self._children: set[asyncio.subprocess.Process] = set()
         self._closed = False
+        # 协调接纳名额的检查/占用/释放与关闭流程：关闭后不得再有新请求占用
+        # 名额；名额释放与 aclose 的等待都在此条件变量上同步，避免漏唤醒
+        self._condition = asyncio.Condition()
 
     @property
     def active(self) -> int:
@@ -99,21 +109,27 @@ class AlignExecutor:
 
     async def run(self, left: str, right: str) -> dict:
         """接纳一次对齐计算；无空位立即失败，超时/被取消即终止并回收子进程。"""
-        if self._closed:
-            raise AlignBusyError("服务正在关闭，不再接纳新的对齐请求")
-        if self._active >= self._max_processes:
-            raise AlignBusyError(
-                f"对齐子进程名额已满（{self._max_processes} 个运行或清理中），请稍后重试"
-            )
-        self._active += 1
+        # 关闭标志与名额占用必须在同一临界区内判定/自增：保证 aclose 置位后
+        # 不会再有请求占用名额，也不会有“检查时未关闭、占用时已关闭”的窗口
+        async with self._condition:
+            if self._closed:
+                raise AlignBusyError("服务正在关闭，不再接纳新的对齐请求")
+            if self._active >= self._max_processes:
+                raise AlignBusyError(
+                    f"对齐子进程名额已满（{self._max_processes} 个运行或清理中），请稍后重试"
+                )
+            self._active += 1
         try:
             # 时限从接纳（占用名额）起算
             deadline = asyncio.get_running_loop().time() + self._timeout_seconds
             return await self._run_in_child(left, right, deadline)
         finally:
             # _run_in_child 返回时子进程必然已回收，此处才释放名额；
-            # 与上面的自增一一对应，不会重复释放
-            self._active -= 1
+            # 与上面的自增一一对应，每个已接纳请求恰好释放一次，关闭流程与
+            # 请求自身的收尾不会重复释放
+            async with self._condition:
+                self._active -= 1
+                self._condition.notify_all()  # 唤醒等待名额归零的 aclose
 
     async def _run_in_child(self, left: str, right: str, deadline: float) -> dict:
         loop = asyncio.get_running_loop()
@@ -124,16 +140,20 @@ class AlignExecutor:
         payload = json.dumps(
             {"left": left, "right": right}, ensure_ascii=False
         ).encode("utf-8")
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable,
-            *self._worker_argv,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=str(_PACKAGE_PARENT),
-        )
-        self._children.add(proc)
+        # 等待子进程创建期间名额已被占用，但 proc 尚未登记进 _children；
+        # 关闭流程以名额（而非 _children）为等待依据，因此不会漏掉本请求
+        proc = await self._spawn_child()
+        async with self._condition:
+            self._children.add(proc)
+            closing = self._closed
         try:
+            if closing:
+                # 子进程在关闭开始后才创建完成：关闭快照未能覆盖它，故由本
+                # 请求立即终止回收（与 aclose 终止已登记子进程同一条路径），
+                # 不投入计算；以 worker 异常路径结束（接口映射 500），与关闭
+                # 前已登记子进程被 aclose 终止的请求表现一致
+                await self._terminate(proc)
+                raise AlignWorkerError("服务正在关闭，对齐子进程已终止并回收")
             try:
                 remaining = max(deadline - loop.time(), 0.0)
                 stdout, stderr = await asyncio.wait_for(
@@ -155,11 +175,23 @@ class AlignExecutor:
             except (UnicodeDecodeError, ValueError) as exc:
                 raise AlignWorkerError("对齐子进程输出无法解析") from exc
         finally:
-            # 正常结束时为幂等空操作；超时/取消/异常时负责终止并回收
+            # 正常结束时为幂等空操作；超时/取消/关闭/异常时负责终止并回收
             try:
                 await self._terminate(proc)
             finally:
-                self._children.discard(proc)
+                async with self._condition:
+                    self._children.discard(proc)
+
+    async def _spawn_child(self) -> asyncio.subprocess.Process:
+        """拉起 worker 子进程（单独成方法，便于测试注入创建延迟）。"""
+        return await asyncio.create_subprocess_exec(
+            sys.executable,
+            *self._worker_argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(_PACKAGE_PARENT),
+        )
 
     async def _terminate(self, proc: asyncio.subprocess.Process) -> None:
         """终止并回收子进程；返回时进程已被回收。重复调用安全。"""
@@ -172,17 +204,39 @@ class AlignExecutor:
         await proc.wait()
 
     async def aclose(self) -> None:
-        """服务关闭：拒绝新请求，终止并回收全部残留子进程。"""
-        self._closed = True
-        children = list(self._children)
-        for proc in children:  # 先全部终止，再统一等待回收
-            if proc.returncode is None:
+        """服务关闭：拒绝新请求，等待全部已接纳请求（含创建途中）终止回收。
+
+        返回时所有已接纳请求均已走到终止-回收路径、子进程全部回收、名额
+        （``_active``）归零；``run`` 与本方法都只走同一条回收路径，不会重复
+        终止子进程或重复释放名额。
+        """
+        async with self._condition:
+            self._closed = True
+        # 循环终止：置位关闭标志后，仍可能有请求正卡在 _spawn_child（子进程
+        # 尚未登记进 _children）。每轮快照终止当前已登记的子进程，再等待名额
+        # 归零；创建途中的请求登记后会自行检测到关闭标志并终止回收、释放名额，
+        # 唤醒本循环后继续下一轮，直到没有任何已接纳请求
+        while True:
+            async with self._condition:
+                if self._active == 0:
+                    return
+                children = list(self._children)
+            for proc in children:  # 先全部终止，再统一等待回收
+                if proc.returncode is None:
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+            for proc in children:
                 try:
-                    proc.kill()
-                except ProcessLookupError:
+                    await proc.wait()
+                except Exception:
                     pass
-        for proc in children:
-            try:
-                await proc.wait()
-            except Exception:
-                pass
+            # 已登记子进程的终止已完成，但对应 run 的 finally（_terminate 回收、
+            # 名额释放）可能还没被调度；创建途中的 run 也需要一轮调度才能完成
+            # 登记-终止-回收。让出事件循环，避免在名额释放前就进入条件等待
+            await asyncio.sleep(0)
+            async with self._condition:
+                # 等待已登记子进程的请求收尾释放名额，以及创建途中的请求完成
+                # 登记-终止-回收；名额释放时的 notify_all 不会漏掉本等待
+                await self._condition.wait_for(lambda: self._active == 0)
